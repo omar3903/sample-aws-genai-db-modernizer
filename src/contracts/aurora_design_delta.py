@@ -264,7 +264,7 @@ class IndexSpec(BaseModel):
     # ``None`` inside the Literal (not ``Literal[...] | None``) so the Bedrock tool
     # schema lists null among the values instead of a nullable-typed enum, which
     # Bedrock refuses (#1281).
-    method: Literal["btree", "hash", "gin", "gist", "brin", None] = Field(
+    method: Literal["btree", "hash", "gin", "gist", "spgist", "brin", None] = Field(
         default=None, description="Index access method (Aurora PostgreSQL only)"
     )
     include: list[str] = Field(

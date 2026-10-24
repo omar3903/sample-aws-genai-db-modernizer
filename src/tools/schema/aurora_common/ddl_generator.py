@@ -114,8 +114,9 @@ class DdlResult:
     tables: list[TableDDL]
     full_ddl: str
     residuals: list[dict]
-    # Source indexes the draft could not carry over as written (a partial-index
-    # predicate Aurora cannot take): {"table", "index", "reason"}.
+    # Source indexes the draft could not carry over as written: a partial-index
+    # predicate Aurora cannot take, or an access method it cannot create or the
+    # collector cannot describe (#293): {"table", "index", "reason"}.
     index_notes: list[dict] = field(default_factory=list)
     # Columns that carry over but need a look: {"table", "column", "kind", "reason"};
     # kind "default" (a source default the draft dropped, or turned into an
@@ -333,7 +334,7 @@ def secondary_indexes(table: AgentTable) -> list[AgentIndex]:
 _TEXT_TYPES = ("VARCHAR", "CHAR", "CHARACTER", "TEXT", "CITEXT")
 
 
-def _text_columns(columns: list[ColumnDDL]) -> set[str]:
+def text_columns(columns: list[ColumnDDL]) -> set[str]:
     """Columns whose draft type is a (non-array) character type."""
     return {
         c.name
@@ -343,12 +344,95 @@ def _text_columns(columns: list[ColumnDDL]) -> set[str]:
     }
 
 
+# #293: the PostgreSQL access methods a source index carries over as-is. ``btree`` needs
+# no USING; ``fulltext`` and ``spatial`` (MySQL sources) and ``other`` have no PostgreSQL
+# spelling, so they stay a plain B-tree index as before.
+_PG_INDEX_METHODS = frozenset({"hash", "gin", "gist", "spgist", "brin"})
+# The methods Aurora MySQL cannot create and no B-tree stands in for: a B-tree on the
+# same columns would not serve the full-text, containment or geometric queries the index
+# exists for, and can fail to build on long values. The draft notes such an index instead
+# of rendering one. A BRIN index is rendered as a B-tree, which serves the same range
+# scans, with a note.
+_MYSQL_DROPPED_METHODS = frozenset({"gin", "gist", "spgist"})
+
+
+def index_method(index: AgentIndex) -> str | None:
+    """The source index's access method, or None for an input written before #293."""
+    return index.index_type.value if index.index_type else None
+
+
+def rendered_method(index: AgentIndex, dialect: Dialect, text_columns: set[str]) -> str | None:
+    """The USING method the draft renders for ``index`` on ``dialect``, or None for a plain
+    B-tree. Aurora MySQL takes no method. A GIN or GiST index over a character column
+    needs an operator class (``gin_trgm_ops`` from pg_trgm, say) the collector does not
+    record, so it stays a B-tree too (``_index_sql`` notes it)."""
+    method = index_method(index)
+    if dialect is not POSTGRES or method not in _PG_INDEX_METHODS:
+        return None
+    if method in ("gin", "gist") and any(c in text_columns for c in index.columns):
+        return None
+    return method
+
+
+def carried_indexes(table: AgentTable, dialect: Dialect) -> list[AgentIndex]:
+    """The secondary indexes the draft renders on ``dialect``, in ``TableDDL.index_sql``
+    order: all of them on Aurora PostgreSQL; on Aurora MySQL, all but the GIN, GiST and
+    SP-GiST indexes it cannot create (``_index_sql`` notes those instead)."""
+    return [
+        i
+        for i in secondary_indexes(table)
+        if not (dialect is MYSQL and index_method(i) in _MYSQL_DROPPED_METHODS)
+    ]
+
+
 def _index_sql(
     table: AgentTable, dialect: Dialect, notes: list[dict], text_columns: set[str]
 ) -> list[str]:
     statements: list[str] = []
     columns = [c.column_name for c in table.columns]
-    for idx in secondary_indexes(table):
+    if dialect is MYSQL:
+        for idx in secondary_indexes(table):
+            method = index_method(idx)
+            if method in _MYSQL_DROPPED_METHODS:
+                notes.append(
+                    {
+                        "table": table.table_name,
+                        "index": idx.index_name,
+                        "reason": (
+                            f"{method.upper()} index not carried over: Aurora MySQL has no "
+                            f"{method} access method, and a B-tree on the same columns would "
+                            "not serve the queries it exists for. Use a FULLTEXT or SPATIAL "
+                            "index where one fits the columns, or serve the search from the "
+                            "application layer."
+                        ),
+                    }
+                )
+    for idx in carried_indexes(table, dialect):
+        method = index_method(idx)
+        using = rendered_method(idx, dialect, text_columns)
+        if dialect is POSTGRES and method in ("gin", "gist") and using is None:
+            notes.append(
+                {
+                    "table": table.table_name,
+                    "index": idx.index_name,
+                    "reason": (
+                        f"{method.upper()} index on a character column carried over as a "
+                        "B-tree: it needs an operator class (gin_trgm_ops or gist_trgm_ops "
+                        "from pg_trgm, say) the collector does not record."
+                    ),
+                }
+            )
+        if dialect is MYSQL and method == "brin":
+            notes.append(
+                {
+                    "table": table.table_name,
+                    "index": idx.index_name,
+                    "reason": (
+                        "BRIN index carried over as a B-tree: Aurora MySQL has no brin access "
+                        "method. A B-tree serves the same range scans but is larger."
+                    ),
+                }
+            )
         unique = bool(idx.is_unique)  # nosemgrep: is-function-without-parentheses
         where_sql = None
         if idx.predicate:
@@ -387,6 +471,7 @@ def _index_sql(
                 idx.index_name,
                 idx.columns,
                 unique=unique,
+                method=using,
                 where_sql=where_sql,
             )
         )
@@ -438,10 +523,12 @@ def _fk_sql(table: AgentTable, dialect: Dialect) -> list[str]:
     return statements
 
 
-def _key_columns(table: AgentTable) -> set[str]:
-    """Columns in the primary key, an index or a foreign key."""
+def _key_columns(table: AgentTable, dialect: Dialect) -> set[str]:
+    """Columns in the primary key, an index the draft renders, or a foreign key."""
     cols = {c.lower() for c in table.primary_key or []}
     for idx in table.indexes or []:
+        if dialect is MYSQL and index_method(idx) in _MYSQL_DROPPED_METHODS:
+            continue  # #293: the draft renders no index on these columns
         cols.update(c.lower() for c in idx.columns)
     for fk in table.foreign_keys or []:
         cols.update(c.lower() for c in fk.columns)
@@ -476,7 +563,7 @@ def _generate(
     family = classify_source_family(source_engine)
 
     for table in tables:
-        keyed = _key_columns(table)
+        keyed = _key_columns(table, dialect)
         has_auto = any(c.is_auto_increment for c in table.columns)
         columns = [
             _column_ddl(
@@ -498,7 +585,7 @@ def _generate(
                 table_name=table.table_name,
                 columns=columns,
                 create_sql=_create_table_sql(table, columns, dialect),
-                index_sql=_index_sql(table, dialect, notes, _text_columns(columns)),
+                index_sql=_index_sql(table, dialect, notes, text_columns(columns)),
                 fk_sql=_fk_sql(table, dialect),
             )
         )

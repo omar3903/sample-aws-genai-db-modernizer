@@ -50,10 +50,10 @@ from src.tools.schema.aurora_common.ddl_generator import (
     TypeOverride,
     TypeOverrides,
     assemble_full_ddl,
+    carried_indexes,
     generate_mysql_ddl,
     generate_pg_ddl,
     render_index,
-    secondary_indexes,
 )
 from src.tools.schema.aurora_common.source_family import migration_strategy
 from src.tools.schema.aurora_common.sql_safety import (
@@ -152,9 +152,9 @@ class AuroraDesignBase:
         return f"sha256:{digest}"
 
 
-def draft_index_names(table: AgentTable) -> list[str]:
-    """Names of the draft's secondary indexes, in ``TableDDL.index_sql`` order."""
-    return [i.index_name for i in secondary_indexes(table)]
+def draft_index_names(table: AgentTable, dialect: Dialect) -> list[str]:
+    """Names of the draft's secondary indexes on ``dialect``, in ``index_sql`` order."""
+    return [i.index_name for i in carried_indexes(table, dialect)]
 
 
 def source_data_types(raw_collector: dict) -> dict[tuple[str, str], str]:
@@ -285,7 +285,7 @@ def _structured_index(base: AuroraDesignBase, table: AgentTable, entry: IndexSpe
                 raise SqlFragmentError('Aurora MySQL identifiers are quoted with backticks, not "')
         elif "`" in parsed.quotes:
             raise SqlFragmentError('Aurora PostgreSQL identifiers are quoted with ", not backticks')
-        if parsed.method not in (None, "btree", "hash", "gin", "gist", "brin"):
+        if parsed.method not in (None, "btree", "hash", "gin", "gist", "spgist", "brin"):
             raise SqlFragmentError(f"unknown index method '{parsed.method}'")
         spec = IndexSpec(
             index_name=parsed.index_name,
@@ -350,7 +350,9 @@ def _apply_index_changes(
             continue
         ddl = table_ddls[table.table_name]
         # name -> statement, in draft order (names come from the source, not the model)
-        current: dict[str, str] = dict(zip(draft_index_names(table), ddl.index_sql, strict=True))
+        current: dict[str, str] = dict(
+            zip(draft_index_names(table, base.dialect), ddl.index_sql, strict=True)
+        )
 
         for j, name in enumerate(change.remove_indexes):
             existing = _lookup(current, name.strip().strip('"`'))
@@ -698,7 +700,7 @@ def full_contract_to_delta(
     draft = base.generate()
     draft_types = {(t.table_name, c.name): c.aurora_type for t in draft.tables for c in t.columns}
     draft_indexes = {
-        t.table_name: dict(zip(draft_index_names(src), t.index_sql, strict=True))
+        t.table_name: dict(zip(draft_index_names(src, base.dialect), t.index_sql, strict=True))
         for src, t in zip(base.tables, draft.tables, strict=True)
     }
     tables: list[dict] = []

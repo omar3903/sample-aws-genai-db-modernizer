@@ -21,6 +21,8 @@ from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from src.contracts.collector_output import IndexType
+
 if TYPE_CHECKING:
     from src.contracts.analysis_output import AnalysisOutputContract, KeyScopedWrite
     from src.contracts.collector_output import CollectorOutputContract
@@ -135,6 +137,10 @@ class AgentIndex(BaseModel):
     columns: list[str]
     is_unique: bool
     is_primary: bool | None = False
+    index_type: IndexType | None = Field(
+        None,
+        description="The source index's access method (#293); absent in older inputs, read as btree",
+    )
     predicate: str | None = Field(None, description="Partial-index predicate, if any")
 
 
@@ -556,6 +562,7 @@ def project_schema_design_input(
                         columns=idx.columns,
                         is_unique=idx.is_unique,  # nosemgrep: is-function-without-parentheses
                         is_primary=idx.is_primary,  # nosemgrep: is-function-without-parentheses
+                        index_type=idx.index_type,
                         predicate=idx.predicate,
                     )
                     for idx in (t.indexes or [])

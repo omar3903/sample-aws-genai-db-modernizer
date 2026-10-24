@@ -5,8 +5,10 @@ from __future__ import annotations
 import pytest
 
 from src.contracts.aurora_design_delta import AuroraDesignDeltaContract
-from src.contracts.schema_design_input import AgentTable
+from src.contracts.schema_design_input import AgentCollectorInput, AgentTable
 from src.tools.schema.aurora_common.ddl_generator import (
+    MYSQL,
+    POSTGRES,
     generate_mysql_ddl,
     generate_pg_ddl,
     is_primary_key_index,
@@ -17,6 +19,7 @@ from src.tools.schema.aurora_common.delta_merge import (
     full_contract_to_delta,
     merge_design_delta,
 )
+from src.tools.schema.aurora_common.design_view import build_design_view
 from src.tools.schema.aurora_common.sql_safety import SqlFragmentError, render_source_predicate
 
 
@@ -56,7 +59,7 @@ def test_pkey_index_is_not_duplicated_as_a_unique_index():
     assert 'PRIMARY KEY ("id")' in ddl
     assert "topics_pkey" not in ddl
     assert 'CREATE UNIQUE INDEX "idx_topics_slug"' in ddl
-    assert draft_index_names(table) == ["idx_topics_slug"]
+    assert draft_index_names(table, POSTGRES) == ["idx_topics_slug"]
 
 
 @pytest.mark.parametrize(
@@ -468,3 +471,311 @@ def test_legacy_modify_of_a_full_index_does_not_warn():
     warnings: list[str] = []
     delta, errors = full_contract_to_delta(base, {**draft, "table_definitions": tables}, warnings)
     assert errors == [] and warnings == []
+
+
+# ---------------------------------------------------------------------------
+# #293: the source index's access method
+# ---------------------------------------------------------------------------
+
+
+def _method_index(method, name="idx_search", columns=("slug",)) -> dict:
+    index = {"index_name": name, "columns": list(columns), "is_unique": False}
+    if method is not None:
+        index["index_type"] = method
+    return index
+
+
+@pytest.mark.parametrize("method", ["gin", "gist", "spgist", "brin", "hash"])
+def test_pg_draft_keeps_the_source_index_method(method):
+    table = _table_with_body([_method_index(method, columns=("body",))])
+    result = generate_pg_ddl([table], source_engine="postgresql")
+
+    assert result.tables[0].index_sql == [
+        f'CREATE INDEX "idx_search" ON "topics" USING {method} ("body");'
+    ]
+    assert result.index_notes == []
+
+
+@pytest.mark.passes_on_main  # guards what main already does for these methods
+@pytest.mark.parametrize("method", [None, "btree", "other", "fulltext", "spatial"])
+def test_pg_draft_renders_a_plain_index_for_a_method_postgres_does_not_spell(method):
+    result = generate_pg_ddl([_table([_method_index(method)])], source_engine="postgresql")
+
+    assert result.tables[0].index_sql == ['CREATE INDEX "idx_search" ON "topics" ("slug");']
+    assert result.index_notes == []
+
+
+def test_pg_draft_keeps_the_method_and_the_partial_predicate_together():
+    index = {**_method_index("gin", columns=("body",)), "predicate": "(deleted_at IS NULL)"}
+    result = generate_pg_ddl([_table_with_body([index])], source_engine="postgresql")
+
+    assert result.tables[0].index_sql == [
+        'CREATE INDEX "idx_search" ON "topics" USING gin ("body") '
+        'WHERE ( "deleted_at" IS NULL );'
+    ]
+
+
+@pytest.mark.parametrize("method", ["gin", "gist", "spgist"])
+def test_mysql_draft_notes_an_index_it_cannot_create_instead_of_a_btree(method):
+    result = generate_mysql_ddl([_table([_method_index(method)])], source_engine="postgresql")
+
+    assert result.tables[0].index_sql == []
+    [note] = result.index_notes
+    assert (note["table"], note["index"]) == ("topics", "idx_search")
+    assert note["reason"].startswith(f"{method.upper()} index not carried over")
+    assert f"Aurora MySQL has no {method} access method" in note["reason"]
+    assert "FULLTEXT or SPATIAL index" in note["reason"]
+
+
+@pytest.mark.passes_on_main  # guards what main already does for these methods
+@pytest.mark.parametrize("method", [None, "btree", "hash", "other"])
+def test_mysql_draft_keeps_the_other_methods_as_plain_indexes(method):
+    result = generate_mysql_ddl([_table([_method_index(method)])], source_engine="postgresql")
+
+    assert result.tables[0].index_sql == ["CREATE INDEX `idx_search` ON `topics` (`slug`);"]
+    assert result.index_notes == []
+
+
+def test_an_input_written_before_index_type_existed_still_loads_as_btree():
+    table = _table([{"index_name": "idx_old", "columns": ["slug"], "is_unique": False}])
+
+    assert table.indexes[0].index_type is None
+    assert generate_pg_ddl([table], source_engine="postgresql").tables[0].index_sql == [
+        'CREATE INDEX "idx_old" ON "topics" ("slug");'
+    ]
+
+
+def test_offline_collection_carries_the_index_method_to_the_draft():
+    """A BRIN index in an offline PostgreSQL collection reaches the draft as BRIN;
+    the offline normalizer used to coerce it to ``other``."""
+    from src.agents.collector.mysql_collector import _build_tables
+    from src.tools.database.offline_parser import parse_offline_collection
+
+    raw = {
+        "metadata": {"database_name": "db"},
+        "tables": [{"table_name": "topics", "row_count": 1}],
+        "columns": [
+            {
+                "table_name": "topics",
+                "column_name": n,
+                "column_type": t,
+                "data_type": t,
+                "is_nullable": "YES",
+            }
+            for n, t in (("id", "bigint"), ("created_at", "timestamp without time zone"))
+        ],
+        "indexes": [
+            {
+                "table_name": "topics",
+                "index_name": "topics_pkey",
+                "column_name": "id",
+                "seq_in_index": 1,
+                "non_unique": 0,
+                "index_type": "btree",
+            },
+            {
+                "table_name": "topics",
+                "index_name": "idx_created",
+                "column_name": "created_at",
+                "seq_in_index": 1,
+                "non_unique": 1,
+                "index_type": "brin",
+            },
+        ],
+        "primary_keys": [{"table_name": "topics", "column_name": "id"}],
+    }
+    [table] = _build_tables(parse_offline_collection(raw)["tables"], "db")
+    assert table.indexes[1].index_type.value == "brin"
+    agent = AgentTable.model_validate(table.model_dump(mode="json"))
+
+    assert generate_pg_ddl([agent], source_engine="postgresql").tables[0].index_sql == [
+        'CREATE INDEX "idx_created" ON "topics" USING brin ("created_at");'
+    ]
+
+
+def _mysql_base_with_a_gin_index() -> AuroraDesignBase:
+    return AuroraDesignBase(
+        engine="aurora_mysql",
+        job_id="j",
+        source_database="db",
+        source_engine="postgresql",
+        tables=[
+            _table(
+                [
+                    {"index_name": "topics_pkey", "columns": ["id"], "is_unique": True},
+                    _method_index("gin", name="idx_search", columns=("slug",)),
+                    _method_index("btree", name="idx_status", columns=("status",)),
+                ]
+            )
+        ],
+    )
+
+
+def test_the_draft_lists_only_the_indexes_it_renders_on_the_dialect():
+    [table] = _mysql_base_with_a_gin_index().tables
+
+    assert draft_index_names(table, POSTGRES) == ["idx_search", "idx_status"]
+    assert draft_index_names(table, MYSQL) == ["idx_status"]
+
+
+def test_mysql_merge_skips_a_dropped_index_consistently():
+    """The merge zips the draft's index names with its statements (strict), so a GIN
+    index the MySQL draft does not render must be absent from both lists; its note
+    becomes a merge warning, like a partial-index note."""
+    base = _mysql_base_with_a_gin_index()
+
+    result = merge_design_delta(
+        base, {"delta_version": "1.0", "tables": [{"table_name": "topics"}]}
+    )
+
+    assert result.errors == []
+    [table] = result.output["table_definitions"]
+    assert table["indexes"] == ["CREATE INDEX `idx_status` ON `topics` (`status`);"]
+    assert any("idx_search" in w and "GIN index not carried over" in w for w in result.warnings)
+
+    delta, errors = full_contract_to_delta(base, result.output)
+    assert errors == []
+    assert delta["tables"] == []
+
+
+def test_a_dropped_index_cannot_be_modified_or_removed_by_name():
+    base = _mysql_base_with_a_gin_index()
+    statement = "CREATE INDEX `idx_search` ON `topics` (`slug`);"
+
+    removed = merge_design_delta(
+        base,
+        {
+            "delta_version": "1.0",
+            "tables": [{"table_name": "topics", "remove_indexes": ["idx_search"]}],
+        },
+    )
+    modified = merge_design_delta(
+        base,
+        {
+            "delta_version": "1.0",
+            "tables": [{"table_name": "topics", "modify_indexes": [statement]}],
+        },
+    )
+
+    assert removed.errors == [
+        "tables[0].remove_indexes[0]: table 'topics' has no index 'idx_search'"
+    ]
+    [error] = modified.errors
+    assert error.startswith(
+        "tables[0].modify_indexes[0]: table 'topics' has no index 'idx_search' to modify"
+    )
+
+
+def test_mysql_draft_carries_a_brin_index_as_a_btree_with_a_note():
+    result = generate_mysql_ddl([_table([_method_index("brin")])], source_engine="postgresql")
+
+    assert result.tables[0].index_sql == ["CREATE INDEX `idx_search` ON `topics` (`slug`);"]
+    [note] = result.index_notes
+    assert (note["table"], note["index"]) == ("topics", "idx_search")
+    assert note["reason"].startswith("BRIN index carried over as a B-tree")
+
+
+def test_mysql_draft_does_not_narrow_a_column_only_a_dropped_index_keyed():
+    """``_key_columns`` narrows indexed text columns to a key-sized type; a column whose
+    only index the MySQL draft drops is treated like an unindexed one."""
+
+    def slug_type(indexes) -> str:
+        ddl = generate_mysql_ddl([_table(indexes)], source_engine="postgresql")
+        return next(c.aurora_type for c in ddl.tables[0].columns if c.name == "slug")
+
+    unindexed = slug_type([])
+    assert slug_type([_method_index("btree")]) != unindexed
+    assert slug_type([_method_index("gin")]) == unindexed
+
+
+def _table_with_body(indexes) -> AgentTable:
+    """``_table`` plus a JSON column: a GIN index fits it, while one on ``slug`` (text)
+    would need an operator class the collector does not record."""
+    data = _table(indexes).model_dump(mode="json")
+    data["columns"].append({"column_name": "body", "data_type": "jsonb", "nullable": True})
+    return AgentTable.model_validate(data)
+
+
+def _collector_for(table: AgentTable) -> AgentCollectorInput:
+    return AgentCollectorInput.model_validate(
+        {
+            "contract_version": "3.0",
+            "job_id": "j",
+            "source_database_name": "db",
+            "source_database_engine": "postgresql",
+            "collection_timestamp": "2026-01-01T00:00:00Z",
+            "tables": [table.model_dump(mode="json")],
+            "queries": {"query_patterns": []},
+        }
+    )
+
+
+def test_pg_draft_keeps_a_gin_index_on_a_text_column_as_a_btree_with_a_note():
+    """A GIN or GiST index over a character column needs an operator class (pg_trgm) the
+    collector does not record, so ``USING gin ("slug")`` would not run."""
+    result = generate_pg_ddl([_table([_method_index("gin")])], source_engine="postgresql")
+
+    assert result.tables[0].index_sql == ['CREATE INDEX "idx_search" ON "topics" ("slug");']
+    [note] = result.index_notes
+    assert (note["table"], note["index"]) == ("topics", "idx_search")
+    assert note["reason"].startswith("GIN index on a character column carried over as a B-tree")
+    assert "operator class" in note["reason"]
+
+
+def test_mysql_draft_gives_a_partial_gin_index_the_one_note():
+    index = {**_method_index("gin"), "predicate": "(deleted_at IS NULL)"}
+    result = generate_mysql_ddl([_table([index])], source_engine="postgresql")
+
+    assert result.tables[0].index_sql == []
+    assert [n["reason"][:24] for n in result.index_notes] == ["GIN index not carried ov"]
+
+
+def test_design_view_lists_the_indexes_the_draft_renders_with_their_method():
+    table = _table_with_body(
+        [
+            {"index_name": "topics_pkey", "columns": ["id"], "is_unique": True},
+            _method_index("gin", name="idx_body", columns=("body",)),
+            _method_index("gin", name="idx_slug", columns=("slug",)),
+            _method_index("btree", name="idx_status", columns=("status",)),
+        ]
+    )
+    collector = _collector_for(table)
+
+    pg = AuroraDesignBase.from_inputs("aurora_postgresql", collector)
+    pg_view = build_design_view(pg, collector)
+    assert pg_view["tables"][0]["indexes"] == [
+        "idx_body (body) USING gin",
+        "idx_slug (slug)",
+        "idx_status (status)",
+    ]
+    assert [n["index"] for n in pg_view["index_notes"]] == ["idx_slug"]
+
+    my = AuroraDesignBase.from_inputs("aurora_mysql", collector)
+    my_view = build_design_view(my, collector)
+    assert my_view["tables"][0]["indexes"] == ["idx_status (status)"]
+    assert [n["index"] for n in my_view["index_notes"]] == ["idx_body", "idx_slug"]
+
+
+def test_pg_merge_accepts_spgist_in_both_index_forms():
+    base = AuroraDesignBase(
+        engine="aurora_postgresql",
+        job_id="j",
+        source_database="db",
+        source_engine="postgresql",
+        tables=[_table_with_body([_method_index("spgist", columns=("body",))])],
+    )
+    statement = 'CREATE INDEX "idx_search" ON "topics" USING spgist ("body");'
+    draft = merge_design_delta(base, {"delta_version": "1.0"}).output
+    assert draft["table_definitions"][0]["indexes"] == [statement]
+
+    structured = {"index_name": "idx_search", "columns": ["body"], "method": "spgist"}
+    for entry in (statement, structured):
+        result = merge_design_delta(
+            base,
+            {
+                "delta_version": "1.0",
+                "tables": [{"table_name": "topics", "modify_indexes": [entry]}],
+            },
+        )
+        assert result.errors == []
+        assert result.output["table_definitions"][0]["indexes"] == [statement]

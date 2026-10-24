@@ -98,6 +98,8 @@ class IndexType(str, Enum):
     hash = "hash"
     gist = "gist"
     gin = "gin"
+    spgist = "spgist"
+    brin = "brin"
     fulltext = "fulltext"
     spatial = "spatial"
     other = "other"

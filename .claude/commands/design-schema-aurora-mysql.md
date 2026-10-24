@@ -39,7 +39,7 @@ Read files with the Read tool (use `offset`/`limit` for large files). Search fil
           `name TYPE [NOT NULL] [AI] [DEFAULT x]`, then `(residual; source t)`
           when the script could not resolve the type, or `(source t)` when the
           source type differs from the draft type), `indexes`
-          (`name [UNIQUE] (columns)`) and `foreign_keys` (`col -> table(col)`)
+          (`name [UNIQUE] (columns) [USING method]`) and `foreign_keys` (`col -> table(col)`)
       - The draft itself and the collector output are not in the file, and you
         do not need them.
       - First Read it with `offset: 1` and `limit: 40` to see `input_pages`
